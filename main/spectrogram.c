@@ -80,7 +80,10 @@ static FILE     *s_seg_fp;
 static uint32_t  s_seg_cur = 0xFFFFFFFFu;  // индекс открытого сегмента (0xFFFFFFFF = нет)
 static uint32_t  s_seg_next;               // следующий индекс для нового сегмента
 static uint32_t  s_seg_rows;               // строк записано в текущий открытый сегмент
-static long      s_seg_opened_at;          // время открытия текущего сегмента (epoch с)
+static long      s_seg_opened_at;          // epoch открытия — шапка/лог, НЕ возрастной триггер
+// #P-024 (issue #49): возраст сегмента от esp_timer, не от wall-clock — скачок
+// SNTP / POST /api/time не должен мгновенно финализировать файл («age = 56 лет»).
+static int64_t   s_seg_opened_uptime_us;
 static time_t    s_seg_last_fsync;         // #FW-63: когда последний раз сбрасывали метаданные открытого сегмента
 // #FW-8-FIX (2026-08-15): защёлка «make_room для текущего сегмента уже вызван».
 // Раньше триггер жил только в строковом пути и стрелял по строгому s_seg_rows==PREP_ROW —
@@ -649,6 +652,9 @@ static bool seg_open_new(void)
         }
     }
     long now = (long)time(NULL);
+    // #P-024: ASWF_FORMAT.md — started_at=0, пока часы < WF_SANE_EPOCH (ось относительная).
+    // Ненулевой near-epoch хуже нуля: потребитель читает любое >0 как абсолютный UTC.
+    long hdr_started_at = (now < (long)WF_SANE_EPOCH) ? 0L : now;
     // #DATA-1b/1c: снимок метаданных сегмента ДО сборки шапки (оба идут в JSON).
     // seg_seq — глоб. монотонный, переживает clear/ребут (NVS); total_at_open —
     // накопительный total прибора сейчас (reconciliation на PC). Персист seq в NVS
@@ -692,7 +698,7 @@ static bool seg_open_new(void)
         s_calib_prev_valid = true;
     }
     wait_flash_quiet();
-    seg_header_build(0, 0, now);
+    seg_header_build(0, 0, hdr_started_at);
     if (!flash_quiet_writer_lock(pdMS_TO_TICKS(500))) {
         ESP_LOGE(TAG, "header lock failed %s", p);
         fclose(f); unlink(p);
@@ -748,12 +754,13 @@ static bool seg_open_new(void)
     s_seg_cur       = s_seg_next;
     s_seg_rows      = 0;
     s_seg_opened_at = now;
+    s_seg_opened_uptime_us = esp_timer_get_time();
     s_seg_last_fsync = (time_t)now;   // #FW-63: отсчёт от открытия, не от прошлого сегмента
     s_seg_prep_done = false;
     s_seg_next++;
     // #FW-60: запись заводится СРАЗУ при открытии — те же seg_seq/started_at, что ушли
     // в шапку файла (см. сборку шапки выше), поэтому листингу нечего дочитывать с flash.
-    LOCK(); reg_add(s_seg_cur, s_seg_seq, (int64_t)now); UNLOCK();
+    LOCK(); reg_add(s_seg_cur, s_seg_seq, (int64_t)hdr_started_at); UNLOCK();
     ESP_LOGI(TAG, "seg_%05" PRIu32 ".aswf opened in %lld us", s_seg_cur,
              (long long)(esp_timer_get_time() - t0));
     hist_drop_diag_wf_flash_end();
@@ -1139,7 +1146,8 @@ static void seg_write_row(const uint8_t *row, uint16_t dur, float temp)
         // #FW-41 v5 суффикс: timestamp + lat(NaN) + lon(NaN) + dose_rate + temperature.
         uint8_t v3tail[WF_TS_BYTES + WF_GPS_BYTES + WF_DOSE_BYTES + WF_TEMP_BYTES];
         {
-            uint32_t ts = (uint32_t)time(NULL);
+            time_t now_ts = time(NULL);
+            uint32_t ts = (now_ts < (time_t)WF_SANE_EPOCH) ? 0u : (uint32_t)now_ts;
             uint32_t nan_bits = 0x7FC00000u;
             float lat_v, lon_v, dose_v;
             memcpy(&lat_v,  &nan_bits, 4);
@@ -1380,7 +1388,8 @@ static void wf_fs_task(void *arg)
         // по фазе с HTTP (issue wf-recorder#1, серии 503). Этот путь не зависит от числа
         // строк вовсе — считает только время, поэтому закрывает случай целиком.
         if (s_seg_fp && !s_seg_prep_done &&
-            (long)(time(NULL) - s_seg_opened_at) >= WF_SEG_MAX_AGE_SEC / 2) {
+            (esp_timer_get_time() - s_seg_opened_uptime_us)
+                >= (int64_t)WF_SEG_MAX_AGE_SEC * 1000000 / 2) {
             /* Запрашиваем РОВНО столько же, сколько запросила бы синхронная
              * «страховка» в пути записи строки (см. выше, тот же
              * WF_ROW_STRIDE + WF_FLASH_RESERVE). Смысл #FW-8 — сдвинуть стирание
@@ -1394,7 +1403,9 @@ static void wf_fs_task(void *arg)
             make_room((uint32_t)WF_ROW_STRIDE + WF_FLASH_RESERVE);
             s_seg_prep_done = true;
         }
-        if (s_seg_fp && (long)(time(NULL) - s_seg_opened_at) >= WF_SEG_MAX_AGE_SEC) {
+        if (s_seg_fp &&
+            (esp_timer_get_time() - s_seg_opened_uptime_us)
+                >= (int64_t)WF_SEG_MAX_AGE_SEC * 1000000) {
             seg_finalize();
             wait_after_seg_close();
         }
@@ -1468,6 +1479,8 @@ void spectrogram_restore(void)
              (uint32_t)st.interval_sec);
 }
 
+// #P-024: чинится только RAM-якорь s_status.started_at (сессия / N42 кольца).
+// s_seg_opened_uptime_us монотонный — скачок time(NULL) его не трогает.
 void spectrogram_time_synced(void)
 {
     bool corrected = false;
