@@ -16,7 +16,8 @@ float spectrum_temp_from_token(const char *p)
     if (*p == '\0')
         return NAN;
 
-    if (tolower((unsigned char)p[0]) == 'o' &&
+    if (p[0] && p[1] && p[2] &&
+        tolower((unsigned char)p[0]) == 'o' &&
         tolower((unsigned char)p[1]) == 'f' &&
         tolower((unsigned char)p[2]) == 'f') {
         char next = p[3];

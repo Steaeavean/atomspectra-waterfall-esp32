@@ -14,6 +14,9 @@ static void test_off_token(void)
     CHECK(IS_NAN(spectrum_temp_from_token(NULL)));
     CHECK(IS_NAN(spectrum_temp_from_token("")));
     CHECK(IS_NAN(spectrum_temp_from_token("xyz")));
+    CHECK(IS_NAN(spectrum_temp_from_token("O")));
+    CHECK(IS_NAN(spectrum_temp_from_token("OF")));
+    CHECK(IS_NAN(spectrum_temp_from_token("o")));
 }
 
 static void test_numeric_token(void)
@@ -28,6 +31,18 @@ static void test_off_prefix_not_offset(void)
 {
     /* "OFFSET" не должен считаться OFF; нет цифр → NaN */
     CHECK(IS_NAN(spectrum_temp_from_token("OFFSET")));
+}
+
+static void test_hold_active(void)
+{
+    CHECK(spectrum_t1_hold_active(0, 0, 0));
+    CHECK(spectrum_t1_hold_active(0, 10000, 0));
+    CHECK(spectrum_t1_hold_active(1, 4999, 0));
+    CHECK(spectrum_t1_hold_active(3, 2500, 0)); /* reconnect retries still held */
+    CHECK(!spectrum_t1_hold_active(1, 5000, 0));
+    CHECK(!spectrum_t1_hold_active(2, 6000, 0));
+    CHECK(spectrum_t1_hold_active(1, 5999, 1000));
+    CHECK(!spectrum_t1_hold_active(1, 6000, 1000));
 }
 
 static void test_json(void)
@@ -45,5 +60,6 @@ void t1_settle_suite(void)
     test_off_token();
     test_numeric_token();
     test_off_prefix_not_offset();
+    test_hold_active();
     test_json();
 }

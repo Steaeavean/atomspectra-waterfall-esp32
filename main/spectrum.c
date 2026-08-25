@@ -456,8 +456,9 @@ void spectrum_process_info_response(const char *text)
         if (*p == '[') { while (*p && *p != ']') p++; if (*p==']') p++; }
         else { while (*p && *p != ' ' && *p != '\n') p++; }
     }
-    if (s_t1_session_inf == 0)
-        d->t1 = NAN;   /* первый -inf сессии USB: T1 не публиковать */
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (spectrum_t1_hold_active(s_t1_session_inf, now_ms, s_t1_open_ms))
+        d->t1 = NAN;   /* до open+5s: T1 не публиковать (в т.ч. reconnect retry) */
     s_t1_session_inf++;
     d->valid = true;
     s_spectrum.temperature[0] = d->t1;
@@ -472,6 +473,8 @@ void spectrum_t1_on_cdc_open(uint32_t now_ms)
     s_t1_session_inf = 0;
     s_t1_refresh_sent = false;
     s_t1_open_ms = now_ms;
+    s_device_info.t1 = NAN;
+    s_spectrum.temperature[0] = NAN;
     SPEC_UNLOCK();
 }
 
@@ -481,6 +484,8 @@ void spectrum_t1_on_cdc_teardown(void)
     s_t1_session_inf = 0;
     s_t1_refresh_sent = false;
     s_t1_open_ms = 0;
+    s_device_info.t1 = NAN;
+    s_spectrum.temperature[0] = NAN;
     SPEC_UNLOCK();
 }
 
