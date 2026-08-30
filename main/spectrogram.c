@@ -86,6 +86,7 @@ static long      s_seg_opened_at;          // epoch открытия — шап�
 // #P-024 (issue #49): возраст сегмента от esp_timer, не от wall-clock — скачок
 // SNTP / POST /api/time не должен мгновенно финализировать файл («age = 56 лет»).
 static int64_t   s_seg_opened_uptime_us;
+static bool      s_seg_rel_axis;           // latched at seg_open_new: header axis is relative
 static time_t    s_seg_last_fsync;         // #FW-63: когда последний раз сбрасывали метаданные открытого сегмента
 // #FW-8-FIX (2026-08-15): защёлка «make_room для текущего сегмента уже вызван».
 // Раньше триггер жил только в строковом пути и стрелял по строгому s_seg_rows==PREP_ROW —
@@ -657,6 +658,7 @@ static bool seg_open_new(void)
     // #P-024: ASWF_FORMAT.md — started_at=0, пока часы < WF_SANE_EPOCH (ось относительная).
     // Ненулевой near-epoch хуже нуля: потребитель читает любое >0 как абсолютный UTC.
     long hdr_started_at = (now < (long)WF_SANE_EPOCH) ? 0L : now;
+    s_seg_rel_axis = (hdr_started_at == 0);
     // #DATA-1b/1c: снимок метаданных сегмента ДО сборки шапки (оба идут в JSON).
     // seg_seq — глоб. монотонный, переживает clear/ребут (NVS); total_at_open —
     // накопительный total прибора сейчас (reconciliation на PC). Персист seq в NVS
@@ -1192,7 +1194,8 @@ static void seg_write_row(const uint8_t *row, uint16_t dur, float temp)
         uint8_t v3tail[WF_TS_BYTES + WF_GPS_BYTES + WF_DOSE_BYTES + WF_TEMP_BYTES];
         {
             time_t now_ts = time(NULL);
-            uint32_t ts = (now_ts < (time_t)WF_SANE_EPOCH) ? 0u : (uint32_t)now_ts;
+            uint32_t ts = (s_seg_rel_axis || now_ts < (time_t)WF_SANE_EPOCH)
+                ? 0u : (uint32_t)now_ts;
             uint32_t nan_bits = 0x7FC00000u;
             float lat_v, lon_v, dose_v;
             memcpy(&lat_v,  &nan_bits, 4);
