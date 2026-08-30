@@ -2,7 +2,7 @@
 #include "spectrogram.h"
 #include "hist_drop_diag.h"
 #include "flash_quiet.h"
-#include "wf_seg_clear_plan.h"  // #FW-65: WF_SEG_CLEAR_PASSES
+#include "wf_seg_delete.h"      // #FW-65: collect-then-unlink (host-pure)
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
@@ -498,17 +498,9 @@ static uint32_t crc32_upd(uint32_t crc, const uint8_t *p, size_t n)
     return crc;
 }
 
-// Разбор имени seg_NNNNN.aswf → индекс. false, если имя не подходит.
 static bool seg_name_index(const char *name, uint32_t *idx)
 {
-    if (strncmp(name, "seg_", 4) != 0) return false;
-    const char *p = name + 4;
-    char *end = NULL;
-    unsigned long v = strtoul(p, &end, 10);
-    if (end == p) return false;                  // ни одной цифры
-    if (strcmp(end, ".aswf") != 0) return false; // неверный суффикс
-    *idx = (uint32_t)v;
-    return true;
+    return wf_seg_name_index(name, idx);
 }
 
 // Собрать JSON-шапку сегмента v5 в s_hdr (добита пробелами до WF_HDR_RESERVE).
@@ -875,59 +867,59 @@ static void make_room(uint32_t need)
  * h_segments when it was a local). Only touched under FSLOCK. */
 static char s_clear_names[WF_SEG_REG_MAX][24];
 
-/* Count seg_* names. ENOENT dir → 0. Other opendir fail → -1. (под s_fs_lock) */
-static int seg_count_on_disk(void)
+static void *fw_opendir(void *ctx, const char *path)
 {
-    DIR *d = opendir(WF_SEG_DIR);
-    if (!d) return (errno == ENOENT) ? 0 : -1;
-    int n = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        uint32_t idx;
-        if (seg_name_index(e->d_name, &idx)) n++;
-    }
-    closedir(d);
-    return n;
+    (void)ctx;
+    return opendir(path);
 }
 
-/* Collect names, closedir, then unlink. Repeat while the dir shrinks.
- * 0 = empty; -1 = leftover or unrecoverable opendir. (под s_fs_lock) */
+static const char *fw_readdir(void *ctx, void *dir)
+{
+    (void)ctx;
+    struct dirent *e = readdir((DIR *)dir);
+    return e ? e->d_name : NULL;
+}
+
+static int fw_closedir(void *ctx, void *dir)
+{
+    (void)ctx;
+    return closedir((DIR *)dir);
+}
+
+static int fw_unlink(void *ctx, const char *path)
+{
+    (void)ctx;
+    if (quiet_unlink_path(path)) return 0;
+    return (errno == ENOENT) ? 1 : -1;
+}
+
+static wf_dir_ops_t fw_dir_ops(void)
+{
+    wf_dir_ops_t o = {
+        .ctx = NULL,
+        .opendir = fw_opendir,
+        .readdir = fw_readdir,
+        .closedir = fw_closedir,
+        .unlink = fw_unlink,
+    };
+    return o;
+}
+
+static int seg_count_on_disk(void)
+{
+    wf_dir_ops_t ops = fw_dir_ops();
+    DIR *probe = opendir(WF_SEG_DIR);
+    if (!probe) return (errno == ENOENT) ? 0 : -1;
+    closedir(probe);
+    return wf_seg_count_on_disk(&ops, WF_SEG_DIR);
+}
+
 static int seg_delete_all(void)
 {
-    for (int pass = 0; pass < WF_SEG_CLEAR_PASSES; pass++) {
-        DIR *d = opendir(WF_SEG_DIR);
-        if (!d) return (errno == ENOENT) ? 0 : -1;
-        int n = 0;
-        int overflow = 0;
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            uint32_t idx;
-            if (!seg_name_index(e->d_name, &idx)) continue;
-            if (n < WF_SEG_REG_MAX) {
-                snprintf(s_clear_names[n], sizeof(s_clear_names[n]), "%s", e->d_name);
-                n++;
-            } else {
-                overflow = 1;
-            }
-        }
-        closedir(d);
-        if (n == 0 && !overflow) return 0;
-        for (int i = 0; i < n; i++) {
-            char p[80];
-            snprintf(p, sizeof(p), WF_SEG_DIR "/%s", s_clear_names[i]);
-            if (!quiet_unlink_path(p) && errno != ENOENT) {
-                ESP_LOGW(TAG, "FW-65: unlink %s: errno=%d", p, errno);
-            }
-        }
-        int left = seg_count_on_disk();
-        if (left < 0) return -1;
-        if (left == 0) return 0;
-        if (!overflow && left >= n) {
-            /* dir did not shrink — further passes will not help */
-            break;
-        }
-    }
-    return (seg_count_on_disk() == 0) ? 0 : -1;
+    wf_dir_ops_t ops = fw_dir_ops();
+    return wf_seg_delete_all(&ops, WF_SEG_DIR,
+                             (char *)s_clear_names, sizeof(s_clear_names[0]),
+                             WF_SEG_REG_MAX, WF_SEG_CLEAR_PASSES);
 }
 
 // Определить stride и payload-offset существующего сегмента по JSON-шапке.
