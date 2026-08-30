@@ -2,6 +2,7 @@
 #include "spectrogram.h"
 #include "hist_drop_diag.h"
 #include "flash_quiet.h"
+#include "wf_seg_clear_plan.h"  // #FW-65: WF_SEG_CLEAR_PASSES
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
@@ -17,6 +18,7 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <errno.h>       // #FW-65: ENOENT on unlink / opendir
 #include <math.h>        // #FW-62: isnan для temp_at_open (t1 = NaN, пока -inf не прочитан)
 
 static const char *TAG = "wf";
@@ -850,20 +852,63 @@ static void make_room(uint32_t need)
     }
 }
 
-// Удалить все сегменты каталога. (под s_fs_lock)
-static void seg_delete_all(void)
+/* #FW-65: BSS, not httpd stack — 256×24 = 6 KiB (same size that overflowed
+ * h_segments when it was a local). Only touched under FSLOCK. */
+static char s_clear_names[WF_SEG_REG_MAX][24];
+
+/* Count seg_* names. ENOENT dir → 0. Other opendir fail → -1. (под s_fs_lock) */
+static int seg_count_on_disk(void)
 {
     DIR *d = opendir(WF_SEG_DIR);
-    if (!d) return;
+    if (!d) return (errno == ENOENT) ? 0 : -1;
+    int n = 0;
     struct dirent *e;
-    char p[80];
     while ((e = readdir(d)) != NULL) {
         uint32_t idx;
-        if (!seg_name_index(e->d_name, &idx)) continue;
-        snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", e->d_name);  // имя ≤24 (seg_name_index), %.32s = доказуемая граница для -Wformat-truncation
-        unlink(p);
+        if (seg_name_index(e->d_name, &idx)) n++;
     }
     closedir(d);
+    return n;
+}
+
+/* Collect names, closedir, then unlink. Repeat while the dir shrinks.
+ * 0 = empty; -1 = leftover or unrecoverable opendir. (под s_fs_lock) */
+static int seg_delete_all(void)
+{
+    for (int pass = 0; pass < WF_SEG_CLEAR_PASSES; pass++) {
+        DIR *d = opendir(WF_SEG_DIR);
+        if (!d) return (errno == ENOENT) ? 0 : -1;
+        int n = 0;
+        int overflow = 0;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            uint32_t idx;
+            if (!seg_name_index(e->d_name, &idx)) continue;
+            if (n < WF_SEG_REG_MAX) {
+                snprintf(s_clear_names[n], sizeof(s_clear_names[n]), "%.23s", e->d_name);
+                n++;
+            } else {
+                overflow = 1;
+            }
+        }
+        closedir(d);
+        if (n == 0 && !overflow) return 0;
+        for (int i = 0; i < n; i++) {
+            char p[80];
+            snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", s_clear_names[i]);
+            if (unlink(p) != 0 && errno != ENOENT) {
+                ESP_LOGW(TAG, "FW-65: unlink %s: errno=%d", p, errno);
+            }
+        }
+        int left = seg_count_on_disk();
+        if (left < 0) return -1;
+        if (left == 0) return 0;
+        if (!overflow && left >= n) {
+            /* dir did not shrink — further passes will not help */
+            break;
+        }
+    }
+    return (seg_count_on_disk() == 0) ? 0 : -1;
 }
 
 // Определить stride и payload-offset существующего сегмента по JSON-шапке.
@@ -1609,11 +1654,103 @@ void spectrogram_prepare_reboot(void)
     FSUNLOCK();
 }
 
+/* #FW-65: leftover after a failed clear — rebuild registry/counters/next
+ * WITHOUT unlinking (no walk mutation). (под s_fs_lock) */
+static void seg_rebuild_counters_from_disk(void)
+{
+    DIR *d = opendir(WF_SEG_DIR);
+    uint32_t maxidx = 0, completed = 0, flash_rows = 0;
+    bool any = false;
+    LOCK();
+    reg_clear_all();
+    UNLOCK();
+    if (!d) {
+        LOCK();
+        s_status.seg_count = 0;
+        s_status.flash_rows = 0;
+        UNLOCK();
+        s_seg_next = 0;
+        return;
+    }
+    struct dirent *e;
+    char p[80];
+    while ((e = readdir(d)) != NULL) {
+        uint32_t idx;
+        if (!seg_name_index(e->d_name, &idx)) continue;
+        snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", e->d_name);
+        struct stat sb;
+        if (stat(p, &sb) != 0) continue;
+        FILE *f = fopen(p, "rb");
+        uint32_t rows = 0;
+        uint32_t rseq = 0;
+        int64_t rstart = 0;
+        if (f) {
+            uint32_t stride = seg_detect_stride(f);
+            long poff = seg_payload_offset(f);
+            long payload = (long)sb.st_size - poff;
+            rows = payload > 0 ? (uint32_t)(payload / stride) : 0;
+            seg_read_ids_open(f, &rseq, &rstart);
+            fclose(f);
+        }
+        LOCK();
+        reg_add(idx, rseq, rstart);
+        reg_mark_finalized(idx, rows, (uint32_t)sb.st_size);
+        UNLOCK();
+        completed++;
+        flash_rows += rows;
+        if (!any || idx > maxidx) { maxidx = idx; any = true; }
+    }
+    closedir(d);
+    s_seg_next = any ? maxidx + 1 : 0;
+    LOCK();
+    s_status.seg_count = completed;
+    s_status.flash_rows = flash_rows;
+    UNLOCK();
+}
+
 int spectrogram_clear(void)
 {
     FSLOCK();
     LOCK();
     if (s_status.recording) { UNLOCK(); FSUNLOCK(); return -1; }
+    UNLOCK();
+
+    if (s_seg_fp) { fclose(s_seg_fp); s_seg_fp = NULL; }
+    s_seg_cur    = 0xFFFFFFFFu;
+    s_seg_zombie = 0xFFFFFFFFu;
+    s_seg_rows = 0;
+    s_seg_prep_done = false;
+
+    /* Offload may hold fopen on the pinned file. Wait without FSLOCK so
+     * offload_done can unpin. Then unlink anyway; EBUSY → leftover → -2. */
+    if (s_seg_pinned != 0xFFFFFFFFu) {
+        FSUNLOCK();
+        for (int i = 0; i < 50; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            FSLOCK();
+            bool still = (s_seg_pinned != 0xFFFFFFFFu);
+            FSUNLOCK();
+            if (!still) break;
+        }
+        FSLOCK();
+    }
+
+    int del_rc = seg_delete_all();
+    int legacy_fail = 0;
+    if (unlink(WF_DATA) != 0 && errno != ENOENT) legacy_fail = 1;
+    if (unlink(WF_META) != 0 && errno != ENOENT) legacy_fail = 1;
+    if (unlink(WF_STATE) != 0 && errno != ENOENT) legacy_fail = 1;
+
+    int left = seg_count_on_disk();
+    if (del_rc != 0 || left < 0 || left > 0 || legacy_fail) {
+        ESP_LOGW(TAG, "FW-65: clear incomplete del=%d left=%d legacy=%d",
+                 del_rc, left, legacy_fail);
+        seg_rebuild_counters_from_disk();
+        FSUNLOCK();
+        return -2;
+    }
+
+    LOCK();
     s_wf_epoch++;
     s_head              = 0;
     s_count             = 0;
@@ -1624,32 +1761,20 @@ int spectrogram_clear(void)
     s_status.flash_full = false;
     s_status.seg_count  = 0;
     reg_clear_all();             // #FW-60: файлов нет — реестр пуст
-    s_status.seg_lost   = 0;     // #FW-57: явная очистка — история потерь тоже стирается
-    s_status.seg_evicted = 0;    // #FW-56: явная очистка пользователем — история вытеснений
-                                 // теряет смысл вместе с самими данными (в отличие от ребута)
-    s_started_uptime_us = 0;     // #FW-21: очистка — сессии нет
+    s_status.seg_lost   = 0;     // #FW-57
+    s_status.seg_evicted = 0;    // #FW-56
+    s_started_uptime_us = 0;     // #FW-21
     UNLOCK();
 
-    if (s_seg_fp) { fclose(s_seg_fp); s_seg_fp = NULL; }
-    s_seg_cur    = 0xFFFFFFFFu;
-    s_seg_pinned = 0xFFFFFFFFu;   // #REC-11-A2: индексы сбрасываются (next=0) — снять устаревший пин
-    s_seg_zombie = 0xFFFFFFFFu;
-    s_seg_rows = 0;
-    s_seg_prep_done = false;
-    seg_delete_all();
+    s_seg_pinned = 0xFFFFFFFFu;
     s_seg_next = 0;
-    unlink(WF_DATA);     // legacy (#REC-6)
-    unlink(WF_META);     // legacy (#REC-6)
-    unlink(WF_STATE);    // #REC-6: сбросить persist-состояние записи
     FSUNLOCK();
 
-    // #FW-56: сброс накопительного счётчика довести до NVS — иначе ребут сразу
-    // после очистки вернул бы старое значение из флеша.
     {
         nvs_handle_t nh;
         if (nvs_open(WF_SETTINGS_NS, NVS_READWRITE, &nh) == ESP_OK) {
             nvs_set_u32(nh, "seg_evict", 0);
-            nvs_set_u32(nh, "seg_lost", 0);   // #FW-57
+            nvs_set_u32(nh, "seg_lost", 0);
             nvs_commit(nh);
             nvs_close(nh);
         }
