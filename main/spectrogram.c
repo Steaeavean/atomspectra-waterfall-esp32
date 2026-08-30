@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>       // #FW-65: ENOENT on unlink / opendir
+#include <stdatomic.h>
 #include <math.h>        // #FW-62: isnan для temp_at_open (t1 = NaN, пока -inf не прочитан)
 
 static const char *TAG = "wf";
@@ -102,6 +103,22 @@ static bool      s_seg_prep_done;          // сброшена = ещё не в�
 static uint32_t  s_seg_pinned = 0xFFFFFFFFu; // #REC-11-A2: сегмент в процессе выгрузки (claim) — кольцо его не трогает
 static uint32_t  s_seg_zombie = 0xFFFFFFFFu; // AUD-ASW126 #2: delivered, unlink deferred
 static uint32_t  s_wf_epoch;                 // AUD-ASW126 #3: start/clear vs make_room window
+static atomic_bool s_clear_pending = ATOMIC_VAR_INIT(false);
+
+void spectrogram_clear_begin_pending(void)
+{
+    atomic_store(&s_clear_pending, true);
+}
+
+void spectrogram_clear_end_pending(void)
+{
+    atomic_store(&s_clear_pending, false);
+}
+
+bool spectrogram_clear_is_pending(void)
+{
+    return atomic_load(&s_clear_pending);
+}
 static uint32_t  s_seg_seq;                // #DATA-1b: глоб. монотонный номер сегмента (NVS-персист, переживает clear/ребут)
 static uint32_t  s_seg_total_at_open;      // #DATA-1c: device cumulative total на момент открытия текущего сегмента
 static char      s_hdr[WF_HDR_RESERVE];    // буфер сборки шапки (только под s_fs_lock)
@@ -1718,15 +1735,22 @@ int spectrogram_clear(void)
     if (s_status.recording) { UNLOCK(); FSUNLOCK(); return -1; }
     UNLOCK();
 
+    /* Writers/uploader see the epoch change before any unlink. */
+    LOCK();
+    s_wf_epoch++;
+    UNLOCK();
+    spectrogram_clear_begin_pending();
+
     if (s_seg_fp) { fclose(s_seg_fp); s_seg_fp = NULL; }
     s_seg_cur    = 0xFFFFFFFFu;
     s_seg_zombie = 0xFFFFFFFFu;
     s_seg_rows = 0;
     s_seg_prep_done = false;
 
+    uint32_t pinned_before = s_seg_pinned;
     /* Offload may hold fopen on the pinned file. Wait without FSLOCK so
-     * offload_done can unpin. Then unlink anyway; EBUSY → leftover → -2. */
-    if (s_seg_pinned != 0xFFFFFFFFu) {
+     * offload_done / cancel can unpin. LittleFS has no EBUSY on unlink. */
+    if (pinned_before != 0xFFFFFFFFu) {
         FSUNLOCK();
         for (int i = 0; i < 50; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1736,6 +1760,14 @@ int spectrogram_clear(void)
             if (!still) break;
         }
         FSLOCK();
+        LOCK();
+        bool rec_again = s_status.recording;
+        UNLOCK();
+        if (rec_again || s_seg_fp != NULL) {
+            spectrogram_clear_end_pending();
+            FSUNLOCK();
+            return -1;
+        }
     }
 
     int del_rc = seg_delete_all();
@@ -1749,12 +1781,12 @@ int spectrogram_clear(void)
         ESP_LOGW(TAG, "FW-65: clear incomplete del=%d left=%d legacy=%d",
                  del_rc, left, legacy_fail);
         seg_rebuild_counters_from_disk();
+        spectrogram_clear_end_pending();
         FSUNLOCK();
         return -2;
     }
 
     LOCK();
-    s_wf_epoch++;
     s_head              = 0;
     s_count             = 0;
     s_status.ring_count = 0;
@@ -1769,8 +1801,10 @@ int spectrogram_clear(void)
     s_started_uptime_us = 0;     // #FW-21
     UNLOCK();
 
-    s_seg_pinned = 0xFFFFFFFFu;
+    if (s_seg_pinned == pinned_before)
+        s_seg_pinned = 0xFFFFFFFFu;
     s_seg_next = 0;
+    spectrogram_clear_end_pending();
     FSUNLOCK();
 
     {
