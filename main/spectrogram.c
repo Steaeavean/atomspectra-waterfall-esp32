@@ -1690,7 +1690,7 @@ static void seg_rebuild_counters_from_disk(void)
     while ((e = readdir(d)) != NULL) {
         uint32_t idx;
         if (!seg_name_index(e->d_name, &idx)) continue;
-        snprintf(p, sizeof(p), WF_SEG_DIR "/%s", e->d_name);
+        snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", e->d_name);
         struct stat sb;
         if (stat(p, &sb) != 0) continue;
         FILE *f = fopen(p, "rb");
