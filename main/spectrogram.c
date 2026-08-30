@@ -904,7 +904,7 @@ static int seg_delete_all(void)
             uint32_t idx;
             if (!seg_name_index(e->d_name, &idx)) continue;
             if (n < WF_SEG_REG_MAX) {
-                snprintf(s_clear_names[n], sizeof(s_clear_names[n]), "%.23s", e->d_name);
+                snprintf(s_clear_names[n], sizeof(s_clear_names[n]), "%s", e->d_name);
                 n++;
             } else {
                 overflow = 1;
@@ -914,8 +914,8 @@ static int seg_delete_all(void)
         if (n == 0 && !overflow) return 0;
         for (int i = 0; i < n; i++) {
             char p[80];
-            snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", s_clear_names[i]);
-            if (unlink(p) != 0 && errno != ENOENT) {
+            snprintf(p, sizeof(p), WF_SEG_DIR "/%s", s_clear_names[i]);
+            if (!quiet_unlink_path(p) && errno != ENOENT) {
                 ESP_LOGW(TAG, "FW-65: unlink %s: errno=%d", p, errno);
             }
         }
@@ -1685,11 +1685,12 @@ static void seg_rebuild_counters_from_disk(void)
     reg_clear_all();
     UNLOCK();
     if (!d) {
-        LOCK();
-        s_status.seg_count = 0;
-        s_status.flash_rows = 0;
-        UNLOCK();
-        s_seg_next = 0;
+        if (errno == ENOENT) {
+            LOCK();
+            s_status.seg_count = 0;
+            UNLOCK();
+            s_seg_next = 0;
+        }
         return;
     }
     struct dirent *e;
@@ -1697,21 +1698,25 @@ static void seg_rebuild_counters_from_disk(void)
     while ((e = readdir(d)) != NULL) {
         uint32_t idx;
         if (!seg_name_index(e->d_name, &idx)) continue;
-        snprintf(p, sizeof(p), WF_SEG_DIR "/%.32s", e->d_name);
+        snprintf(p, sizeof(p), WF_SEG_DIR "/%s", e->d_name);
         struct stat sb;
         if (stat(p, &sb) != 0) continue;
         FILE *f = fopen(p, "rb");
-        uint32_t rows = 0;
+        if (!f) continue;
+        uint32_t stride = seg_detect_stride(f);
+        long poff = seg_payload_offset(f);
+        long payload = (long)sb.st_size - poff;
+        uint32_t rows = payload > 0 ? (uint32_t)(payload / stride) : 0;
         uint32_t rseq = 0;
         int64_t rstart = 0;
-        if (f) {
-            uint32_t stride = seg_detect_stride(f);
-            long poff = seg_payload_offset(f);
-            long payload = (long)sb.st_size - poff;
-            rows = payload > 0 ? (uint32_t)(payload / stride) : 0;
-            seg_read_ids_open(f, &rseq, &rstart);
+        if (rows == 0) {
+            /* same as seg_reconcile: zero-row stubs are not live segments.
+             * rebuild does not unlink. */
             fclose(f);
+            continue;
         }
+        seg_read_ids_open(f, &rseq, &rstart);
+        fclose(f);
         LOCK();
         reg_add(idx, rseq, rstart);
         reg_mark_finalized(idx, rows, (uint32_t)sb.st_size);
@@ -1721,9 +1726,11 @@ static void seg_rebuild_counters_from_disk(void)
         if (!any || idx > maxidx) { maxidx = idx; any = true; }
     }
     closedir(d);
-    s_seg_next = any ? maxidx + 1 : 0;
+    if (any)
+        s_seg_next = maxidx + 1;
     LOCK();
     s_status.seg_count = completed;
+    /* leftover inventory, not a session-monotonic increment */
     s_status.flash_rows = flash_rows;
     UNLOCK();
 }
